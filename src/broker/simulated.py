@@ -38,10 +38,17 @@ class SimulatedPaperBroker(AbstractBrokerAdapter):
         self.fee_per_trade = fee_per_trade
         self.connected = False
 
-        # In-memory collections
         self.positions: Dict[str, Position] = {}  # position_id -> Position
         self.pending_orders: Dict[str, OrderRequest] = {}  # order_id -> OrderRequest
+        self.open_orders: Dict[str, Any] = {}  # order_id -> simulated open Order
         self.price_feed: Dict[str, float] = {}  # ticker -> current_price
+
+    @property
+    def supports_native_bracket(self) -> bool:
+        return True
+
+    def get_open_orders(self) -> List[Any]:
+        return list(self.open_orders.values())
 
     def connect(self) -> bool:
         self.connected = True
@@ -138,6 +145,36 @@ class SimulatedPaperBroker(AbstractBrokerAdapter):
             self.cash -= self.fee_per_trade
 
             pos_id = f"pos_{uuid.uuid4().hex[:8]}"
+            stop_price = order.stop_loss or (execution_price * 0.95)
+            take_price = order.take_profit or (execution_price * 1.10)
+
+            legs = []
+            sl_leg_id = None
+            tp_leg_id = None
+            if order.stop_loss:
+                sl_leg_id = f"sim_leg_sl_{uuid.uuid4().hex[:8]}"
+                self.open_orders[sl_leg_id] = {
+                    "order_id": sl_leg_id,
+                    "ticker": ticker,
+                    "side": "SELL",
+                    "type": "STOP_LOSS",
+                    "stop_price": order.stop_loss,
+                    "qty": qty,
+                }
+                legs.append({"id": sl_leg_id, "type": "stop_loss", "stop_price": order.stop_loss})
+
+            if order.take_profit:
+                tp_leg_id = f"sim_leg_tp_{uuid.uuid4().hex[:8]}"
+                self.open_orders[tp_leg_id] = {
+                    "order_id": tp_leg_id,
+                    "ticker": ticker,
+                    "side": "SELL",
+                    "type": "TAKE_PROFIT",
+                    "limit_price": order.take_profit,
+                    "qty": qty,
+                }
+                legs.append({"id": tp_leg_id, "type": "take_profit", "limit_price": order.take_profit})
+
             new_pos = Position(
                 position_id=pos_id,
                 broker_position_id=f"broker_{pos_id}",
@@ -146,8 +183,8 @@ class SimulatedPaperBroker(AbstractBrokerAdapter):
                 qty=qty,
                 entry_price=execution_price,
                 current_price=execution_price,
-                stop_loss=order.stop_loss or (execution_price * 0.95),
-                take_profit=order.take_profit or (execution_price * 1.10),
+                stop_loss=stop_price,
+                take_profit=take_price,
                 market_value=notional,
                 unrealized_pnl=0.0,
                 status=PositionStatus.OPEN,
@@ -165,6 +202,12 @@ class SimulatedPaperBroker(AbstractBrokerAdapter):
                 filled_dollar_amount=notional,
                 fee=self.fee_per_trade,
                 slippage=round(abs(execution_price - current_price) * qty, 4),
+                raw_response={
+                    "position_id": pos_id,
+                    "legs": legs,
+                    "stop_loss_order_id": sl_leg_id,
+                    "take_profit_order_id": tp_leg_id,
+                },
             )
 
         elif order.side == OrderSide.SELL:
@@ -251,6 +294,14 @@ class SimulatedPaperBroker(AbstractBrokerAdapter):
             exit_reason=exit_reason,
         )
         self.positions[position_id] = closed_pos
+
+        # Remove open leg orders associated with this ticker
+        leg_ids_to_remove = [
+            oid for oid, ord_data in self.open_orders.items()
+            if isinstance(ord_data, dict) and ord_data.get("ticker") == pos.ticker
+        ]
+        for oid in leg_ids_to_remove:
+            self.open_orders.pop(oid, None)
 
         return OrderResult(
             order_id=f"close_{uuid.uuid4().hex[:8]}",

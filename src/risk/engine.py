@@ -49,9 +49,23 @@ class RiskEngine:
         soft_halt_equity: float = 80.0,
         hard_liquidation_equity: float = 70.0,
         lock_file: Path = LOCK_FILE_PATH,
+        require_reconciled: bool = True,
+        watchdog_max_cadence_seconds: float = 300.0,
+        portfolio_risk_limits: Optional[PortfolioRiskLimits] = None,
+        concentration_limits: Optional[ConcentrationRiskLimits] = None,
+        exit_policy_config: Optional[ExitPolicyConfig] = None,
     ):
+        self.require_reconciled = require_reconciled
+        self.watchdog_max_cadence_seconds = watchdog_max_cadence_seconds
+        self.last_watchdog_run_at: Optional[datetime] = None
         self.db = db
         self.broker = broker
+        from src.risk.portfolio_risk import PortfolioRiskEvaluator
+        from src.risk.concentration import ConcentrationRiskManager
+        from src.risk.exit_policy import ExitPolicyManager
+        self.portfolio_risk = PortfolioRiskEvaluator(db=self.db, broker=self.broker, limits=portfolio_risk_limits)
+        self.concentration_manager = ConcentrationRiskManager(db=self.db, broker=self.broker, limits=concentration_limits)
+        self.exit_policy = ExitPolicyManager(db=self.db, broker=self.broker, config=exit_policy_config)
         self.max_slots = max_slots
         self.slot_target_usd = slot_target_usd
         self.cash_buffer_usd = cash_buffer_usd
@@ -92,7 +106,7 @@ class RiskEngine:
         """
         Evaluates equity against the two-tier circuit breaker:
         Tier 0: Normal (> $80.00)
-        Tier 1: Soft Buy Halt (<= $80.00 and > $70.00)
+        Tier 1: Soft Buy Halt (<= $80.00 and > $70.00, or persistent soft freeze active)
         Tier 2: Hard Liquidation Floor (<= $70.00 or HALTED.lock present)
         """
         if self.is_hard_locked():
@@ -101,10 +115,67 @@ class RiskEngine:
         if equity <= self.hard_liquidation_equity:
             self.set_hard_lock(f"Equity (${equity:.2f}) breached hard floor (${self.hard_liquidation_equity:.2f})")
             return CircuitBreakerTier.HARD_LIQUIDATION
-        elif equity <= self.soft_halt_equity:
+        elif self.is_soft_freeze_active() or equity <= self.soft_halt_equity:
             return CircuitBreakerTier.SOFT_HALT
 
         return CircuitBreakerTier.NORMAL
+
+    def is_soft_freeze_active(self) -> bool:
+        """Returns True if persistent soft freeze is active."""
+        return self.db.is_soft_freeze_active()
+
+    def get_soft_freeze_reason(self) -> str:
+        """Returns the recorded reason for persistent soft freeze."""
+        ctrl = self.db.get_soft_freeze_details()
+        if ctrl and ctrl.get("reason"):
+            return str(ctrl["reason"])
+        return "Soft freeze active"
+
+    def engage_soft_freeze(self, actor: str = "operator", reason: str = "Operator engaged soft freeze") -> None:
+        """Engages persistent soft freeze, halting new buy orders while allowing exits to run."""
+        self.db.set_soft_freeze(enabled=True, actor=actor, reason=reason)
+        self.db.save_audit_log(
+            severity=AuditSeverity.WARNING,
+            component="RiskEngine",
+            event_name="OPERATOR_SOFT_FREEZE_ENGAGED",
+            message=f"Soft freeze engaged by {actor}: {reason}",
+            metadata={"actor": actor, "reason": reason},
+        )
+
+    def release_soft_freeze(self, actor: str = "operator", reason: str = "Operator released soft freeze") -> None:
+        """Releases persistent soft freeze, resuming normal entry evaluation."""
+        self.db.set_soft_freeze(enabled=False, actor=actor, reason=reason)
+        self.db.save_audit_log(
+            severity=AuditSeverity.INFO,
+            component="RiskEngine",
+            event_name="OPERATOR_SOFT_FREEZE_RELEASED",
+            message=f"Soft freeze released by {actor}: {reason}",
+            metadata={"actor": actor, "reason": reason},
+        )
+
+    def check_reconciliation_and_pending(self) -> Tuple[bool, str]:
+        """Fail-closed gate (ADR 0002): account must be reconciled and no unknown intents outstanding."""
+        if self.require_reconciled:
+            event = self.db.get_latest_reconciliation_event()
+            if event is None or event.get("resolution_status") not in (
+                "HEALTHY_MATCH",
+                "RESOLVED_RECONCILED",
+            ):
+                return False, (
+                    "Execution blocked: Account state is unreconciled or has unresolved "
+                    "discrepancies (ADR 0002)"
+                )
+        for intent in self.db.get_pending_order_intents():
+            if intent.get("status") == "UNKNOWN_PENDING_RECONCILIATION":
+                return False, (
+                    "Execution blocked: Order intent in UNKNOWN_PENDING_RECONCILIATION "
+                    "state requires reconciliation"
+                )
+        return True, "OK"
+
+    def reserved_cash(self) -> float:
+        """Cash reserved by pending (CREATED/SUBMITTED/UNKNOWN) order intents."""
+        return sum(float(i.get("allocated_usd") or 0.0) for i in self.db.get_pending_order_intents())
 
     def calculate_position_size(
         self, candidate: ScreenedCandidate, current_cash: float
@@ -117,7 +188,11 @@ class RiskEngine:
         4. Fractional shares floored to 4 decimals.
         Returns: (approved, capital_usd, qty, reason)
         """
-        available_cash = max(0.0, current_cash - self.cash_buffer_usd)
+        if self.is_soft_freeze_active():
+            reason = self.get_soft_freeze_reason()
+            return False, 0.0, 0.0, f"SOFT_FREEZE_ACTIVE: {reason}"
+
+        available_cash = max(0.0, current_cash - self.cash_buffer_usd - self.reserved_cash())
         if available_cash < 10.0:  # Minimum viable entry
             return False, 0.0, 0.0, f"Insufficient cash above $10 buffer (Available: ${available_cash:.2f})"
 
@@ -193,13 +268,51 @@ class RiskEngine:
             self.execute_emergency_liquidation()
             return False, None, None, "Execution blocked: Hard liquidation triggered."
 
+        if self.is_soft_freeze_active():
+            reason = self.get_soft_freeze_reason()
+            return False, None, None, f"SOFT_FREEZE_ACTIVE: {reason}"
+
         if tier == CircuitBreakerTier.SOFT_HALT:
             return False, None, None, f"Execution blocked: Soft Freeze active (Equity ${balance.equity:.2f} <= $80.00)."
 
-        # 3. Check Slot Contention
+        # 2b. Reconciliation / unknown-order gate
+        gate_ok, gate_reason = self.check_reconciliation_and_pending()
+        if not gate_ok:
+            return False, None, None, gate_reason
+
+        # 2c. Degraded-protection policy (ADR 0002 / P3-02)
+        has_native = getattr(self.broker, "supports_native_bracket", False)
+        watchdog_ok = self.is_watchdog_healthy()
+        if not has_native and not watchdog_ok:
+            return False, None, None, (
+                "Execution blocked: Broker lacks native bracket protection and "
+                "software watchdog is unhealthy or exceeds cadence threshold (ADR 0002)"
+            )
+
+        # Check if any active open position is in DEGRADED_UNPROTECTED state
         open_positions = self.broker.get_positions()
-        if len(open_positions) >= self.max_slots:
-            return False, None, None, f"Execution blocked: All {self.max_slots} slots currently occupied."
+        for p in open_positions:
+            prot = self.db.get_protection_status_for_position(p.position_id)
+            if prot and (
+                prot.get("protection_mode") == "DEGRADED_UNPROTECTED"
+                or prot.get("watchdog_healthy") == 0
+            ):
+                return False, None, None, (
+                    f"Execution blocked: Position for {p.ticker} is in DEGRADED_UNPROTECTED state (ADR 0002)"
+                )
+
+        # 3. Check Slot Contention (pending intents reserve slots)
+        pending_intents = self.db.get_pending_order_intents()
+        if len(open_positions) + len(pending_intents) >= self.max_slots:
+            return False, None, None, (
+                f"Execution blocked: All {self.max_slots} slots currently occupied "
+                "or reserved by pending orders."
+            )
+        for intent in pending_intents:
+            if str(intent.get("ticker", "")).upper() == candidate.ticker.upper():
+                return False, None, None, (
+                    f"Execution blocked: Pending order intent for {candidate.ticker} already exists."
+                )
 
         # Check ticker duplicate
         for p in open_positions:
@@ -212,6 +325,20 @@ class RiskEngine:
         )
         if not ok:
             return False, None, None, f"Risk sizing rejected: {size_reason}"
+
+        # 4a. Concentration & Event-Risk checks (P3-04)
+        conc_ok, conc_reason, _ = self.concentration_manager.evaluate_concentration(
+            candidate.ticker, allocated_usd=allocated_usd
+        )
+        if not conc_ok:
+            return False, None, None, f"Execution blocked: {conc_reason}"
+
+        # 4b. Portfolio risk limits (daily/weekly losses, consecutive loss pause, stop risk cap - P3-03)
+        risk_per_share = max(0.0, candidate.entry_est - candidate.stop_loss)
+        cand_risk_usd = round(risk_per_share * target_qty, 2)
+        pr_ok, pr_reason, _ = self.portfolio_risk.evaluate_entry(cand_risk_usd)
+        if not pr_ok:
+            return False, None, None, f"Execution blocked: {pr_reason}"
 
         # 5. Order state machine creation
         order_id = f"ord_{uuid.uuid4().hex[:8]}"
@@ -256,6 +383,9 @@ class RiskEngine:
             broker_pos = self.broker.get_position(candidate.ticker.upper())
             if broker_pos:
                 self.db.save_position(broker_pos)
+                from src.broker.protection import BrokerProtectionService
+                prot_svc = BrokerProtectionService(self.db, self.broker)
+                prot_svc.record_entry_protection(order_res, broker_pos, allow_watchdog_fallback=watchdog_ok)
 
             self.db.save_audit_log(
                 severity=AuditSeverity.INFO,
@@ -276,46 +406,45 @@ class RiskEngine:
         self, current_prices: Dict[str, float]
     ) -> List[Tuple[str, str, float]]:
         """
-        Bar close bracket watchdog:
-        Audits all open positions against stop-loss and take-profit targets.
-        Detects overnight gap-throughs and executes exits.
+        Bar close bracket watchdog and comprehensive exit policy execution:
+        Audits all open positions against stop-loss, take-profit, time stops,
+        trailing stops, and pre-earnings liquidation rules.
         Returns list of (ticker, exit_reason, exit_price).
         """
-        open_positions = self.broker.get_positions()
-        exits = []
+        executed = self.exit_policy.run_exit_policy(current_prices)
 
-        for pos in open_positions:
-            price = current_prices.get(pos.ticker.upper(), pos.current_price)
+        self.last_watchdog_run_at = datetime.now(timezone.utc)
+        self.db.set_system_control(
+            "watchdog_heartbeat",
+            self.last_watchdog_run_at.isoformat(),
+            actor="RiskEngine",
+            reason="Watchdog heartbeat execution",
+        )
+        return [(e["ticker"], e["exit_reason"], e["exit_price"]) for e in executed]
 
-            exit_reason = None
-            if pos.stop_loss and price <= pos.stop_loss:
-                # Check for gap-through stop
-                exit_reason = ExitReason.STOP_LOSS
-            elif pos.take_profit and price >= pos.take_profit:
-                exit_reason = ExitReason.TAKE_PROFIT
+    def is_watchdog_healthy(self, as_of: Optional[datetime] = None) -> bool:
+        """
+        Verifies that the software watchdog has executed within the required cadence threshold.
+        """
+        if self.last_watchdog_run_at is None:
+            ctrl = self.db.get_system_control("watchdog_heartbeat")
+            if ctrl and ctrl.get("value"):
+                try:
+                    self.last_watchdog_run_at = datetime.fromisoformat(ctrl["value"])
+                except Exception:
+                    pass
 
-            if exit_reason:
-                res = self.broker.close_position(pos.position_id)
-                exits.append((pos.ticker, exit_reason.value, price))
+        if self.last_watchdog_run_at is None:
+            return False
 
-                # Update database
-                db_pos = self.db.get_position(pos.position_id)
-                if db_pos:
-                    db_pos.status = PositionStatus.CLOSED
-                    db_pos.closed_at = datetime.now(timezone.utc)
-                    db_pos.current_price = price
-                    db_pos.realized_pnl = round((price - db_pos.entry_price) * db_pos.qty, 2)
-                    db_pos.exit_reason = exit_reason
-                    self.db.update_position(db_pos)
+        now = as_of or datetime.now(timezone.utc)
+        if self.last_watchdog_run_at.tzinfo is None:
+            self.last_watchdog_run_at = self.last_watchdog_run_at.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
 
-                self.db.save_audit_log(
-                    severity=AuditSeverity.INFO,
-                    component="RiskEngine",
-                    event_name="WATCHDOG_BRACKET_EXIT",
-                    message=f"Watchdog closed position on {pos.ticker} at ${price:.2f} ({exit_reason.value})",
-                )
-
-        return exits
+        elapsed = (now - self.last_watchdog_run_at).total_seconds()
+        return elapsed <= self.watchdog_max_cadence_seconds
 
     def record_portfolio_snapshot(self) -> PortfolioSnapshot:
         """Captures and persists full portfolio snapshot."""

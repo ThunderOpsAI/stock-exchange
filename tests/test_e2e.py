@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+pytestmark = pytest.mark.e2e
+
 from src.broker.simulated import SimulatedPaperBroker
 from src.data.pipeline import MarketDataPipeline
 from src.domain.models import CandidateStatus, OrderState, PositionStatus, StrategyType, VerdictOutcome
@@ -60,6 +62,7 @@ def e2e_env():
 
     broker = SimulatedPaperBroker(initial_cash=100.0)
     risk_engine = RiskEngine(db=db, broker=broker, lock_file=lock_path)
+    db.record_reconciliation_event("evt_clean", "h_local", "h_broker", "[]", "HEALTHY_MATCH")
     committee = TriadLLMCommittee(db=db, cache_mode=CacheMode.RECORD_ON_MISS)
     screener = QuantitativeScreener()
 
@@ -75,10 +78,10 @@ def test_full_trading_day_simulation(e2e_env):
     db, broker, risk_engine, committee, screener, _ = e2e_env
 
     # 1. Market Data Ingestion & Technical Indicator Suite
-    spy_df = build_synthetic_uptrend_bars(num_bars=120, base_price=450.0)
+    spy_df = build_synthetic_uptrend_bars(num_bars=250, base_price=450.0)
     spy_enriched = MarketDataPipeline.compute_indicators(spy_df)
 
-    nvda_df = build_synthetic_uptrend_bars(num_bars=120, base_price=120.0)
+    nvda_df = build_synthetic_uptrend_bars(num_bars=250, base_price=120.0)
     nvda_enriched = MarketDataPipeline.compute_indicators(nvda_df, spy_df=spy_enriched)
 
     # Force NVDA last bar to be a valid Trend Pullback reversal setup

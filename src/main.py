@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,7 @@ from src.backtest.tier1_vectorized import Tier1VectorizedBacktester
 from src.backtest.tier2_replay import Tier2HistoricalReplayEngine
 from src.broker.base import AbstractBrokerAdapter
 from src.broker.factory import get_broker_adapter
+from src.broker.reconciliation import ReconciliationService
 from src.data.pipeline import MarketDataPipeline
 from src.domain.models import (
     AuditSeverity,
@@ -61,6 +63,7 @@ class TradingDeskOrchestrator:
         universe: Optional[List[str]] = None,
     ):
         self.db = Database(db_path=db_path)
+        self.broker_type = broker_type
         self.broker = get_broker_adapter(broker_type)
         self.risk_engine = RiskEngine(db=self.db, broker=self.broker)
         self.screener = QuantitativeScreener()
@@ -69,6 +72,46 @@ class TradingDeskOrchestrator:
         self.universe = universe or DEFAULT_UNIVERSE
 
     def run_daily_cycle(self) -> Dict[str, Any]:
+        """Run one cycle under a singleton lease with startup reconciliation (fail closed)."""
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        if not self.db.acquire_run_lease(
+            run_id, mode="paper" if self.broker_type != "simulated" else "simulation",
+            trigger="MANUAL", lease_owner=f"pid{os.getpid()}",
+        ):
+            self.db.save_audit_log(
+                severity=AuditSeverity.WARNING,
+                component="Orchestrator",
+                event_name="RUN_REJECTED_LEASE_HELD",
+                message="Another run holds the singleton lease; aborting.",
+            )
+            return {"status": "REJECTED_LEASE_HELD"}
+        try:
+            recon = ReconciliationService(db=self.db, broker=self.broker).reconcile(run_id=run_id)
+            if not recon.is_clean:
+                msg = f"Reconciliation not clean ({recon.status}); new entries blocked"
+                self.db.save_audit_log(
+                    severity=AuditSeverity.CRITICAL,
+                    component="Orchestrator",
+                    event_name="RUN_BLOCKED_RECONCILIATION",
+                    message=msg,
+                )
+                self.db.release_run_lease(run_id, "FAILED", error_message=msg)
+                return {"status": "BLOCKED_RECONCILIATION", "run_id": run_id}
+            result = self._execute_cycle()
+            self.db.release_run_lease(run_id, "COMPLETED")
+            result["run_id"] = run_id
+            return result
+        except Exception as exc:
+            self.db.save_audit_log(
+                severity=AuditSeverity.CRITICAL,
+                component="Orchestrator",
+                event_name="RUN_FAILED",
+                message=f"{type(exc).__name__}: {exc}",
+            )
+            self.db.release_run_lease(run_id, "FAILED", error_message=f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _execute_cycle(self) -> Dict[str, Any]:
         """
         Executes a single end-to-end trading desk cycle:
         1. Audit & Lock check

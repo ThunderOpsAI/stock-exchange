@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
+pytestmark = pytest.mark.integration
+
 from src.broker.simulated import SimulatedPaperBroker
 from src.domain.models import (
     CandidateStatus,
@@ -40,6 +42,7 @@ def obs_env():
 
     broker = SimulatedPaperBroker(initial_cash=100.0)
     risk_engine = RiskEngine(db=db, broker=broker, lock_file=lock_path)
+    db.record_reconciliation_event("evt_clean", "h_local", "h_broker", "[]", "HEALTHY_MATCH")
     handler = TelegramBotHandler(db=db, broker=broker, risk_engine=risk_engine)
 
     yield handler, broker, db, risk_engine, lock_path

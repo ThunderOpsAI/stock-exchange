@@ -13,7 +13,7 @@ __pycache__/
 htmlcov/
 
 # Local databases and cache
-data/
+/data/
 *.db
 *.db-wal
 *.db-shm

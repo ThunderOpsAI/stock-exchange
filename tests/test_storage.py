@@ -9,6 +9,8 @@ import tempfile
 from datetime import datetime, timezone
 import pytest
 
+pytestmark = pytest.mark.integration
+
 from src.domain.models import (
     AgentRole,
     AgentStance,

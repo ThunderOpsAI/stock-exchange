@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from src.backtest.costs import CostModelConfig, ExecutionCostModel
+from src.backtest.manifest import DataManifest
 from src.data.pipeline import MarketDataPipeline
 from src.screener.screener import QuantitativeScreener
 
@@ -34,6 +36,11 @@ class BacktestResult:
     circuit_breaker_breaches: int
     final_equity: float
     equity_curve: List[float]
+    manifest_id: Optional[str] = None
+    manifest: Optional[DataManifest] = None
+    code_version: Optional[Dict[str, str]] = None
+    cost_summary: Optional[Dict[str, Any]] = None
+    cost_assumptions: Optional[Dict[str, Any]] = None
 
 
 class Tier1VectorizedBacktester:
@@ -45,6 +52,7 @@ class Tier1VectorizedBacktester:
         cash_buffer_usd: float = 10.0,
         max_risk_cap_usd: float = 3.0,
         half_spread_bps: float = 3.0,
+        cost_config: Optional[CostModelConfig] = None,
     ):
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -52,17 +60,43 @@ class Tier1VectorizedBacktester:
         self.cash_buffer_usd = cash_buffer_usd
         self.max_risk_cap_usd = max_risk_cap_usd
         self.half_spread_pct = half_spread_bps / 10000.0
+        self.cost_config = cost_config or CostModelConfig(
+            half_spread_bps=half_spread_bps, slippage_bps=0.0
+        )
+        self.cost_model = ExecutionCostModel(self.cost_config)
         self.screener = QuantitativeScreener(
             slot_target_usd=slot_target_usd, max_risk_cap_usd=max_risk_cap_usd
         )
 
     def run(
-        self, universe_dfs: Dict[str, pd.DataFrame], spy_df: Optional[pd.DataFrame] = None
+        self,
+        universe_dfs: Dict[str, pd.DataFrame],
+        spy_df: Optional[pd.DataFrame] = None,
+        manifest: Optional[DataManifest] = None,
     ) -> BacktestResult:
         """
         Runs day-by-day vectorized bar progression.
         Guarantees: Signal[t-1] executes at Open[t].
+        Attaches reproducible DataManifest.
         """
+        if manifest is not None:
+            is_valid, errors = manifest.verify_data_integrity(universe_dfs)
+            if not is_valid:
+                raise ValueError(f"Data manifest integrity verification failed: {'; '.join(errors)}")
+            active_manifest = manifest
+        else:
+            active_manifest = DataManifest.from_universe(
+                universe_dfs=universe_dfs,
+                assumptions={
+                    "initial_capital_usd": self.initial_capital,
+                    "max_slots": self.max_slots,
+                    "slot_target_usd": self.slot_target_usd,
+                    "cash_buffer_usd": self.cash_buffer_usd,
+                    "max_risk_cap_usd": self.max_risk_cap_usd,
+                    "half_spread_bps": self.half_spread_pct * 10000.0,
+                },
+            )
+
         # Align all dates across universe
         all_dates = set()
         for df in universe_dfs.values():
@@ -88,9 +122,30 @@ class Tier1VectorizedBacktester:
 
         pending_signals: List[Dict] = []
 
+        self.cost_model.reset_summary()
+
         for idx, date in enumerate(sorted_dates):
             if idx == 0:
                 continue
+
+            # Process corporate actions on open positions for today's date
+            for pos in open_positions:
+                new_q, new_e, new_sl, new_tp, div_cash, delist = self.cost_model.process_corporate_actions_for_date(
+                    ticker=pos["ticker"],
+                    current_date_str=str(date),
+                    position_shares=pos["qty"],
+                    entry_price=pos["entry_price"],
+                    stop_loss=pos["stop_loss"],
+                    take_profit=pos["take_profit"],
+                )
+                pos["qty"] = new_q
+                pos["entry_price"] = new_e
+                pos["stop_loss"] = new_sl
+                pos["take_profit"] = new_tp
+                if div_cash > 0:
+                    cash += div_cash
+                if delist == "DELISTED":
+                    pos["force_delist"] = True
 
             # 1. Execute PENDING SIGNALS from yesterday at today's OPEN
             for sig in pending_signals:
@@ -98,34 +153,39 @@ class Tier1VectorizedBacktester:
                 df_sym = enriched_universe.get(sym)
                 if df_sym is not None and date in df_sym.index:
                     open_price = df_sym.loc[date, "open"]
-                    # Apply half-spread slippage to buy entry
-                    exec_price = open_price * (1.0 + self.half_spread_pct)
+                    bar_vol = df_sym.loc[date, "volume"] if "volume" in df_sym.columns else None
 
                     # Check slot availability & cash buffer
                     available_cash = max(0.0, cash - self.cash_buffer_usd)
                     if len(open_positions) < self.max_slots and available_cash >= 10.0:
-                        risk_per_share = max(0.50, exec_price - sig["stop_loss"])
+                        risk_per_share = max(0.50, open_price - sig["stop_loss"])
                         alloc_cap = min(
                             self.slot_target_usd,
                             available_cash,
-                            (self.max_risk_cap_usd * exec_price) / risk_per_share,
+                            (self.max_risk_cap_usd * open_price) / risk_per_share,
                         )
-                        qty = math.floor((alloc_cap / exec_price) * 10000) / 10000.0
-                        if qty > 0:
-                            cost = round(qty * exec_price, 2)
-                            cash -= cost
-                            open_positions.append(
-                                {
-                                    "ticker": sym,
-                                    "qty": qty,
-                                    "entry_price": exec_price,
-                                    "stop_loss": sig["stop_loss"],
-                                    "take_profit": sig["take_profit"],
-                                    "entry_date": date,
-                                    "holding_days": 0,
-                                    "risk_r": risk_per_share,
-                                }
+                        target_shares = math.floor((alloc_cap / open_price) * 10000) / 10000.0
+                        if target_shares > 0:
+                            exec_price, qty, fee = self.cost_model.calculate_entry_execution(
+                                raw_price=open_price,
+                                target_shares=target_shares,
+                                bar_volume=bar_vol,
                             )
+                            if qty > 0:
+                                cost = round(qty * exec_price, 2) + fee
+                                cash -= cost
+                                open_positions.append(
+                                    {
+                                        "ticker": sym,
+                                        "qty": qty,
+                                        "entry_price": exec_price,
+                                        "stop_loss": sig["stop_loss"],
+                                        "take_profit": sig["take_profit"],
+                                        "entry_date": date,
+                                        "holding_days": 0,
+                                        "risk_r": risk_per_share,
+                                    }
+                                )
 
             pending_signals = []
 
@@ -148,23 +208,46 @@ class Tier1VectorizedBacktester:
 
                 exit_price = None
                 exit_reason = None
+                exit_fee = 0.0
 
-                # Check gap-through stop on open
-                if open_p <= pos["stop_loss"]:
-                    exit_price = open_p * (1.0 - self.half_spread_pct)
-                    exit_reason = "GAP_STOP"
-                elif low <= pos["stop_loss"]:
-                    exit_price = pos["stop_loss"] * (1.0 - self.half_spread_pct)
-                    exit_reason = "STOP_LOSS"
+                if pos.get("force_delist"):
+                    exit_price, exit_fee, exit_reason = self.cost_model.calculate_exit_execution(
+                        stop_price=open_p,
+                        bar_open=open_p,
+                        bar_low=low,
+                        shares=pos["qty"],
+                        is_stop_loss=True,
+                    )
+                    exit_reason = "DELISTED"
+                elif open_p <= pos["stop_loss"] or low <= pos["stop_loss"]:
+                    exit_price, exit_fee, exit_reason = self.cost_model.calculate_exit_execution(
+                        stop_price=pos["stop_loss"],
+                        bar_open=open_p,
+                        bar_low=low,
+                        shares=pos["qty"],
+                        is_stop_loss=True,
+                    )
                 elif high >= pos["take_profit"]:
-                    exit_price = pos["take_profit"] * (1.0 - self.half_spread_pct)
+                    exit_price, exit_fee, exit_reason = self.cost_model.calculate_exit_execution(
+                        stop_price=pos["take_profit"],
+                        bar_open=open_p,
+                        bar_low=low,
+                        shares=pos["qty"],
+                        is_stop_loss=False,
+                    )
                     exit_reason = "TAKE_PROFIT"
                 elif pos["holding_days"] >= 10:  # Time stop
-                    exit_price = close * (1.0 - self.half_spread_pct)
+                    exit_price, exit_fee, exit_reason = self.cost_model.calculate_exit_execution(
+                        stop_price=close,
+                        bar_open=open_p,
+                        bar_low=low,
+                        shares=pos["qty"],
+                        is_stop_loss=False,
+                    )
                     exit_reason = "TIME_STOP"
 
                 if exit_price:
-                    proceeds = round(pos["qty"] * exit_price, 2)
+                    proceeds = round(pos["qty"] * exit_price, 2) - exit_fee
                     pnl = round(proceeds - (pos["qty"] * pos["entry_price"]), 2)
                     cash += proceeds
                     trade_pnls.append(pnl)
@@ -263,4 +346,9 @@ class Tier1VectorizedBacktester:
             circuit_breaker_breaches=circuit_breaker_breaches,
             final_equity=equity,
             equity_curve=equity_curve,
+            manifest_id=active_manifest.manifest_id,
+            manifest=active_manifest,
+            code_version=active_manifest.code_version,
+            cost_summary=self.cost_model.summary.to_dict(),
+            cost_assumptions=self.cost_model.config.to_dict(),
         )

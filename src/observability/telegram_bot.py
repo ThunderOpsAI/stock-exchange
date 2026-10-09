@@ -1,16 +1,21 @@
 """
-Telegram Observability Bot & HITL Escalation Daemon.
+Telegram Observability Bot, Transport Adapter & HITL Escalation Daemon.
 Implements:
+- TelegramTransportAdapter: HTTP transport for Telegram Bot API with error auditing and retry/mocking support.
 - Core commands: /status, /positions, /journal [ticker], /soft_freeze, /emergency_liquidate, /resume
 - Interactive HITL Escalation Card formatting with inline action buttons
-- Callback button handling for human trade approval/rejection
+- Callback button handling for human trade approval/rejection with deduplication & replay protection
+- Sender authorization (TELEGRAM_ALLOWED_USER_IDS)
+- Webhook / polling update processor
 """
 
 from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+import requests
 
 from src.broker.base import AbstractBrokerAdapter
 from src.domain.models import (
@@ -28,6 +33,130 @@ from src.risk.engine import LOCK_FILE_PATH, RiskEngine
 from src.storage.db import Database
 
 
+class TelegramTransportError(Exception):
+    """Raised when Telegram HTTP transport fails."""
+    pass
+
+
+class TelegramTransportAdapter:
+    """
+    HTTP transport adapter for Telegram Bot API.
+    Handles send_message, answer_callback_query, get_updates, and set_webhook.
+    Audits transport errors into SQLite database.
+    """
+
+    def __init__(
+        self,
+        bot_token: Optional[str] = None,
+        session: Optional[requests.Session] = None,
+        db: Optional[Database] = None,
+        base_url: str = "https://api.telegram.org",
+    ):
+        self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.session = session or requests.Session()
+        self.db = db
+        self.base_url = base_url.rstrip("/")
+
+    @property
+    def api_url(self) -> str:
+        return f"{self.base_url}/bot{self.bot_token}"
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        json_data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        url = f"{self.api_url}/{endpoint.lstrip('/')}"
+        try:
+            resp = self.session.request(
+                method=method,
+                url=url,
+                json=json_data,
+                params=params,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                desc = data.get("description", "Unknown Telegram API error")
+                err_msg = f"Telegram API error {endpoint}: {desc}"
+                self._record_error(err_msg, {"endpoint": endpoint, "response": data})
+                raise TelegramTransportError(err_msg)
+            return data
+        except requests.RequestException as e:
+            err_msg = f"Telegram HTTP transport failure {endpoint}: {e}"
+            self._record_error(err_msg, {"endpoint": endpoint, "error": str(e)})
+            raise TelegramTransportError(err_msg) from e
+
+    def _record_error(self, message: str, metadata: Dict[str, Any]) -> None:
+        if self.db is not None:
+            try:
+                self.db.save_audit_log(
+                    severity=AuditSeverity.ERROR,
+                    component="TelegramTransport",
+                    event_name="TELEGRAM_TRANSPORT_ERROR",
+                    message=message,
+                    metadata=metadata,
+                )
+            except Exception:
+                pass
+
+    def send_message(
+        self,
+        chat_id: Union[str, int],
+        text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+        parse_mode: str = "Markdown",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "text": text,
+            "parse_mode": parse_mode,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._request("POST", "sendMessage", json_data=payload)
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: Optional[str] = None,
+        show_alert: bool = False,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        }
+        if text:
+            payload["text"] = text
+        return self._request("POST", "answerCallbackQuery", json_data=payload)
+
+    def get_updates(
+        self,
+        offset: Optional[int] = None,
+        timeout: int = 30,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"timeout": timeout, "limit": limit}
+        if offset is not None:
+            params["offset"] = offset
+        res = self._request("GET", "getUpdates", params=params, timeout=timeout + 5)
+        return res.get("result", [])
+
+    def set_webhook(
+        self,
+        url: str,
+        secret_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"url": url}
+        if secret_token:
+            payload["secret_token"] = secret_token
+        return self._request("POST", "setWebhook", json_data=payload)
+
+
 class TelegramBotHandler:
     def __init__(
         self,
@@ -36,12 +165,66 @@ class TelegramBotHandler:
         risk_engine: RiskEngine,
         bot_token: Optional[str] = None,
         chat_id: Optional[str] = None,
+        allowed_user_ids: Optional[Union[List[str], Set[str], str]] = None,
+        transport: Optional[TelegramTransportAdapter] = None,
     ):
         self.db = db
         self.broker = broker
         self.risk_engine = risk_engine
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
+
+        # Configure allowed user IDs for sender authorization
+        if allowed_user_ids is not None:
+            if isinstance(allowed_user_ids, str):
+                self.allowed_user_ids: Optional[Set[str]] = {
+                    uid.strip() for uid in allowed_user_ids.split(",") if uid.strip()
+                }
+            else:
+                self.allowed_user_ids = {str(uid).strip() for uid in allowed_user_ids if str(uid).strip()}
+        else:
+            env_allowed = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").strip()
+            if env_allowed:
+                self.allowed_user_ids = {uid.strip() for uid in env_allowed.split(",") if uid.strip()}
+            else:
+                self.allowed_user_ids = None
+
+        self.transport = transport
+        self.processed_callback_ids: Set[str] = set()
+        self.update_offset: int = 0
+
+    # -------------------------------------------------------------
+    # 0. Authorization & Security
+    # -------------------------------------------------------------
+    def is_user_authorized(self, user_id: Optional[Union[str, int]]) -> bool:
+        """
+        Validates if the user_id is authorized to execute commands/actions.
+        If allowed_user_ids is configured, rejects unauthorized callers and logs audit event.
+        """
+        if self.allowed_user_ids is None:
+            return True
+
+        if user_id is None:
+            self.db.save_audit_log(
+                severity=AuditSeverity.WARNING,
+                component="TelegramBot",
+                event_name="UNAUTHORIZED_TELEGRAM_ACCESS",
+                message="Unauthorized access attempt: missing user ID",
+            )
+            return False
+
+        uid_str = str(user_id).strip()
+        if uid_str not in self.allowed_user_ids:
+            self.db.save_audit_log(
+                severity=AuditSeverity.WARNING,
+                component="TelegramBot",
+                event_name="UNAUTHORIZED_TELEGRAM_ACCESS",
+                message=f"Unauthorized access attempt from user_id: {uid_str}",
+                metadata={"user_id": uid_str},
+            )
+            return False
+
+        return True
 
     # -------------------------------------------------------------
     # 1. Command Handlers
@@ -128,13 +311,8 @@ class TelegramBotHandler:
 
         return "\n\n".join(lines)
 
-    def handle_soft_freeze(self) -> str:
-        self.db.save_audit_log(
-            severity=AuditSeverity.WARNING,
-            component="TelegramBot",
-            event_name="OPERATOR_SOFT_FREEZE",
-            message="Operator initiated soft freeze via Telegram command.",
-        )
+    def handle_soft_freeze(self, actor: str = "telegram_operator") -> str:
+        self.risk_engine.engage_soft_freeze(actor=actor, reason="Operator initiated soft freeze via Telegram command")
         return "⚠️ *SOFT FREEZE ENGAGED*: New buy orders halted. Active positions will run to bracket stops."
 
     def handle_emergency_liquidate(self) -> str:
@@ -142,9 +320,19 @@ class TelegramBotHandler:
         self.risk_engine.set_hard_lock("Emergency liquidation triggered by operator via Telegram")
         return f"🚨 *EMERGENCY LIQUIDATION ENGAGED*: Closed {len(results)} positions. Persistent HALTED.lock created."
 
-    def handle_resume(self) -> str:
-        if self.risk_engine.release_hard_lock():
+    def handle_resume(self, actor: str = "telegram_operator") -> str:
+        hard_cleared = self.risk_engine.release_hard_lock()
+        soft_cleared = False
+        if self.risk_engine.is_soft_freeze_active():
+            self.risk_engine.release_soft_freeze(actor=actor, reason="Operator resumed trading via Telegram")
+            soft_cleared = True
+
+        if hard_cleared and soft_cleared:
+            return "✅ *TRADING RESUMED*: HALTED.lock and soft freeze cleared by operator. Desk returned to active state."
+        elif hard_cleared:
             return "✅ *TRADING RESUMED*: HALTED.lock cleared by operator. Desk returned to active state."
+        elif soft_cleared:
+            return "✅ *TRADING RESUMED*: Soft freeze cleared by operator. Desk returned to active state."
         return "ℹ️ *TRADING RESUME*: No active HALTED.lock file was found."
 
     # -------------------------------------------------------------
@@ -210,18 +398,35 @@ class TelegramBotHandler:
         }
 
     # -------------------------------------------------------------
-    # 3. Callback Query Handler
+    # 3. Callback Query Handler (with Replay Protection)
     # -------------------------------------------------------------
     def handle_callback(self, callback_data: str) -> Tuple[bool, str]:
         """
         Executes action when human clicks inline button:
         'hitl_approve:<candidate_id>' or 'hitl_reject:<candidate_id>'
+        Replay protection: harmless if already approved, rejected, or resolved.
         """
         action, _, cand_id = callback_data.partition(":")
         candidate = self.db.get_candidate(cand_id)
 
         if not candidate:
             return False, f"Candidate {cand_id} not found."
+
+        # Check existing candidate status and verdict for replay protection
+        verdict = self.db.get_committee_verdict(cand_id)
+        if verdict and verdict.hitl_status in (
+            HITLStatus.HUMAN_APPROVED,
+            HITLStatus.HUMAN_REJECTED,
+            HITLStatus.TIMED_OUT,
+        ):
+            return True, f"ℹ️ Callback replay harmless: candidate {cand_id} already resolved ({verdict.hitl_status.value})."
+
+        if candidate.status in (
+            CandidateStatus.APPROVED,
+            CandidateStatus.VETOED,
+            CandidateStatus.EXPIRED,
+        ):
+            return True, f"ℹ️ Callback replay harmless: candidate {cand_id} already in terminal state ({candidate.status.value})."
 
         if action == "hitl_approve":
             self.db.update_hitl_verdict(cand_id, HITLStatus.HUMAN_APPROVED)
@@ -238,3 +443,133 @@ class TelegramBotHandler:
             return True, f"❌ Trade REJECTED by Operator for {candidate.ticker}."
 
         return False, "Unknown callback action."
+
+    # -------------------------------------------------------------
+    # 4. Dispatchers & Update Processing
+    # -------------------------------------------------------------
+    def dispatch_command(
+        self,
+        command_text: str,
+        user_id: Optional[Union[str, int]] = None,
+    ) -> str:
+        """Dispatches text commands with sender authorization."""
+        if not self.is_user_authorized(user_id):
+            return "⛔ Unauthorized: Access denied."
+
+        parts = command_text.strip().split()
+        if not parts:
+            return "Invalid command."
+
+        cmd = parts[0].lower()
+        if cmd.startswith("/"):
+            cmd = cmd[1:]
+        # Remove bot suffix if any, e.g., /status@MyBot -> status
+        cmd = cmd.split("@")[0]
+
+        arg = parts[1] if len(parts) > 1 else None
+
+        if cmd == "status":
+            return self.handle_status()
+        elif cmd == "positions":
+            return self.handle_positions()
+        elif cmd == "journal":
+            return self.handle_journal(arg)
+        elif cmd == "soft_freeze":
+            return self.handle_soft_freeze(actor=f"telegram:{user_id or 'operator'}")
+        elif cmd == "emergency_liquidate":
+            return self.handle_emergency_liquidate()
+        elif cmd == "resume":
+            return self.handle_resume(actor=f"telegram:{user_id or 'operator'}")
+        else:
+            return f"Unknown command: /{cmd}. Available: /status, /positions, /journal, /soft_freeze, /emergency_liquidate, /resume"
+
+    def dispatch_callback(
+        self,
+        callback_query_id: str,
+        callback_data: str,
+        user_id: Optional[Union[str, int]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Dispatches callback query with authorization, deduplication, and acknowledgement.
+        """
+        if not self.is_user_authorized(user_id):
+            if self.transport:
+                try:
+                    self.transport.answer_callback_query(
+                        callback_query_id,
+                        text="⛔ Unauthorized user.",
+                        show_alert=True,
+                    )
+                except Exception:
+                    pass
+            return False, "⛔ Unauthorized user."
+
+        # Replay protection by callback_query_id
+        if callback_query_id in self.processed_callback_ids:
+            if self.transport:
+                try:
+                    self.transport.answer_callback_query(
+                        callback_query_id,
+                        text="Action already processed.",
+                    )
+                except Exception:
+                    pass
+            return True, "Callback query already processed (replay harmless)."
+
+        ok, msg = self.handle_callback(callback_data)
+        self.processed_callback_ids.add(callback_query_id)
+
+        if self.transport:
+            try:
+                self.transport.answer_callback_query(
+                    callback_query_id,
+                    text="Decision recorded." if ok else "Action rejected.",
+                )
+            except Exception:
+                pass
+
+        return ok, msg
+
+    def process_update(self, update: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Processes a raw Telegram Update dict (webhook or polling).
+        Returns a structured outcome dict.
+        """
+        if "message" in update:
+            msg = update["message"]
+            user_id = msg.get("from", {}).get("id")
+            chat_id = msg.get("chat", {}).get("id")
+            text = msg.get("text", "")
+            response = self.dispatch_command(text, user_id=user_id)
+            if self.transport and chat_id:
+                try:
+                    self.transport.send_message(chat_id=chat_id, text=response)
+                except Exception:
+                    pass
+            return {"type": "message", "user_id": user_id, "response": response}
+
+        elif "callback_query" in update:
+            cq = update["callback_query"]
+            cq_id = str(cq.get("id", ""))
+            data = str(cq.get("data", ""))
+            user_id = cq.get("from", {}).get("id")
+            ok, msg = self.dispatch_callback(cq_id, data, user_id=user_id)
+            return {"type": "callback_query", "user_id": user_id, "ok": ok, "message": msg}
+
+        return {"type": "ignored", "reason": "unsupported_update_type"}
+
+    def poll_once(self, timeout: int = 0) -> List[Dict[str, Any]]:
+        """
+        Polls updates once via transport, dispatches each, and updates offset.
+        """
+        if not self.transport:
+            return []
+
+        updates = self.transport.get_updates(offset=self.update_offset, timeout=timeout)
+        results: List[Dict[str, Any]] = []
+        for u in updates:
+            up_id = u.get("update_id")
+            if up_id is not None:
+                self.update_offset = max(self.update_offset, up_id + 1)
+            results.append(self.process_update(u))
+        return results

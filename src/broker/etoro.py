@@ -68,6 +68,10 @@ class EtoroBrokerAdapter(AbstractBrokerAdapter):
         self.symbol_cache: Dict[str, int] = {}
         self.connected = False
 
+    @property
+    def supports_native_bracket(self) -> bool:
+        return False
+
     def _headers(self) -> Dict[str, str]:
         return {
             "x-api-key": self.api_key,

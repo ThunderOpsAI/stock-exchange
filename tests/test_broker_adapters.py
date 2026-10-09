@@ -6,6 +6,8 @@ Tests orders, fills, fractional sizing, rate-limiting, and error handling.
 from unittest.mock import MagicMock, patch
 import pytest
 
+pytestmark = pytest.mark.integration
+
 from src.broker.alpaca import AlpacaPaperBroker
 from src.broker.base import AbstractBrokerAdapter
 from src.broker.etoro import EtoroBrokerAdapter, TokenBucketRateLimiter

@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+pytestmark = pytest.mark.integration
+
 from src.backtest.tier1_vectorized import Tier1VectorizedBacktester
 from src.backtest.tier2_replay import Tier2HistoricalReplayEngine, ReplayTradeRecord, ReplayReport
 from src.broker.simulated import SimulatedPaperBroker

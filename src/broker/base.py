@@ -4,7 +4,7 @@ Defines standard interface for Simulated, Alpaca, and eToro execution adapters.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from src.domain.models import AccountBalance, OrderRequest, OrderResult, Position
 
@@ -14,6 +14,15 @@ class AbstractBrokerAdapter(ABC):
     Abstract broker interface protocol.
     All broker adapters (Simulated, Alpaca, eToro) adhere strictly to this contract.
     """
+
+    @property
+    def supports_native_bracket(self) -> bool:
+        """Returns True if the broker natively supports server-side bracket orders (SL/TP legs)."""
+        return False
+
+    def get_open_orders(self) -> List[Any]:
+        """Retrieve open/pending orders from the broker."""
+        return []
 
     @abstractmethod
     def connect(self) -> bool:

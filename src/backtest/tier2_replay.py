@@ -17,6 +17,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from src.backtest.costs import CostModelConfig, ExecutionCostModel
+from src.backtest.manifest import DataManifest
 from src.broker.simulated import SimulatedPaperBroker
 from src.data.pipeline import MarketDataPipeline
 from src.domain.models import (
@@ -63,6 +65,11 @@ class ReplayReport:
     hard_liquidations_triggered: int
     trades: List[ReplayTradeRecord] = field(default_factory=list)
     equity_curve: List[float] = field(default_factory=list)
+    manifest_id: Optional[str] = None
+    manifest: Optional[DataManifest] = None
+    code_version: Optional[Dict[str, str]] = None
+    cost_summary: Optional[Dict[str, Any]] = None
+    cost_assumptions: Optional[Dict[str, Any]] = None
 
 
 class Tier2HistoricalReplayEngine:
@@ -72,11 +79,16 @@ class Tier2HistoricalReplayEngine:
         cache_mode: CacheMode = CacheMode.RECORD_ON_MISS,
         initial_capital: float = 100.0,
         base_spread_bps: float = 3.0,
+        cost_config: Optional[CostModelConfig] = None,
     ):
         self.db = db
         self.cache_mode = cache_mode
         self.initial_capital = initial_capital
         self.base_spread_bps = base_spread_bps
+        self.cost_config = cost_config or CostModelConfig(
+            half_spread_bps=base_spread_bps, slippage_bps=0.0
+        )
+        self.cost_model = ExecutionCostModel(self.cost_config)
 
         self.screener = QuantitativeScreener()
         self.committee = TriadLLMCommittee(db=self.db, cache_mode=self.cache_mode)
@@ -102,10 +114,27 @@ class Tier2HistoricalReplayEngine:
         universe_dfs: Dict[str, pd.DataFrame],
         spy_df: Optional[pd.DataFrame] = None,
         regime_name: str = "Historical Stress Replay",
+        manifest: Optional[DataManifest] = None,
     ) -> ReplayReport:
         """Executes full event-driven bar-by-bar historical replay."""
+        if manifest is not None:
+            is_valid, errors = manifest.verify_data_integrity(universe_dfs)
+            if not is_valid:
+                raise ValueError(f"Data manifest integrity verification failed: {'; '.join(errors)}")
+            active_manifest = manifest
+        else:
+            active_manifest = DataManifest.from_universe(
+                universe_dfs=universe_dfs,
+                source=f"replay_{regime_name.lower().replace(' ', '_')}",
+                assumptions={
+                    "initial_capital_usd": self.initial_capital,
+                    "base_spread_bps": self.base_spread_bps,
+                    "regime_name": regime_name,
+                },
+            )
+
         broker = SimulatedPaperBroker(initial_cash=self.initial_capital, slippage_bps=0.0)
-        risk_engine = RiskEngine(db=self.db, broker=broker)
+        risk_engine = RiskEngine(db=self.db, broker=broker, require_reconciled=False)  # simulated broker; no external state
 
         # Precompute indicators
         enriched_universe = {}
@@ -286,4 +315,9 @@ class Tier2HistoricalReplayEngine:
             hard_liquidations_triggered=hard_liquidations,
             trades=trade_records,
             equity_curve=equity_curve,
+            manifest_id=active_manifest.manifest_id,
+            manifest=active_manifest,
+            code_version=active_manifest.code_version,
+            cost_summary=self.cost_model.summary.to_dict(),
+            cost_assumptions=self.cost_model.config.to_dict(),
         )

@@ -170,13 +170,36 @@ class TriadLLMCommittee:
         df: Optional[pd.DataFrame] = None,
         headlines: Optional[List[Dict[str, Any]]] = None,
         force_risk_dissent: bool = False,
+        enriched_digest: Optional[Any] = None,
     ) -> Tuple[CommitteeVerdict, List[LLMDeliberation]]:
         """
         Executes full committee deliberation across the 3 personas and resolves consensus.
+        Fails closed if enriched_digest has missing required contexts.
         """
-        digest = self.build_digest(
-            candidate, df=df, headlines=headlines, force_risk_dissent=force_risk_dissent
-        )
+        if enriched_digest is not None and not getattr(enriched_digest, "is_complete", True):
+            reason = getattr(
+                enriched_digest,
+                "blocking_reason",
+                "Missing required context (fail closed ADR 0002)",
+            )
+            verdict = CommitteeVerdict(
+                verdict_id=f"verd_blocked_{candidate.ticker.lower()}_{uuid.uuid4().hex[:6]}",
+                candidate_id=candidate.candidate_id,
+                ticker=candidate.ticker,
+                timestamp=datetime.now(timezone.utc),
+                composite_score=0.0,
+                verdict_outcome=VerdictOutcome.AUTO_DROPPED,
+                risk_officer_dissent=True,
+                hitl_status=None,
+            )
+            return verdict, []
+
+        if enriched_digest is not None:
+            digest = enriched_digest.to_dict()
+        else:
+            digest = self.build_digest(
+                candidate, df=df, headlines=headlines, force_risk_dissent=force_risk_dissent
+            )
 
         # 1. Evaluate 3 agents
         out_sent = self._evaluate_agent_with_cache(self.sentiment_analyst, digest, candidate)

@@ -46,6 +46,19 @@ class AlpacaPaperBroker(AbstractBrokerAdapter):
         )
         self.connected = False
 
+    @property
+    def supports_native_bracket(self) -> bool:
+        return True
+
+    def get_open_orders(self) -> List[Any]:
+        try:
+            resp = self.session.get(f"{self.base_url}/orders?status=open", timeout=self.timeout)
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+        except requests.RequestException:
+            return []
+
     def connect(self) -> bool:
         if not self.api_key or not self.secret_key:
             self.connected = False
