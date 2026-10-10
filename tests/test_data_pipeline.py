@@ -484,3 +484,43 @@ def test_pipeline_fetch_execution_quote_with_quote_provider():
     assert quote.bid == 140.0
     assert quote.ask == 140.04
     mock_provider.assert_called_once_with("IBM")
+
+def test_fetch_daily_bars_mocked():
+    from src.data.pipeline import MarketDataPipeline
+    from unittest.mock import patch, MagicMock
+    import pandas as pd
+    
+    pipeline = MarketDataPipeline()
+    with patch("src.data.pipeline.yf.Ticker") as mock_ticker:
+        mock_instance = MagicMock()
+        
+        # mock df with right columns
+        df = pd.DataFrame({
+            "Open": [100.0] * 30,
+            "High": [105.0] * 30,
+            "Low": [95.0] * 30,
+            "Close": [102.0] * 30,
+            "Volume": [1000] * 30
+        }, index=pd.to_datetime(pd.date_range("2025-01-01", periods=30)))
+        df.index.name = "Date"
+        mock_instance.history.return_value = df
+        mock_ticker.return_value = mock_instance
+        
+        res = pipeline.fetch_daily_bars("AAPL", days=10)
+        assert res is not None
+        assert "open" in res.columns
+        assert res.iloc[0]["open"] == 100.0
+
+def test_fetch_news_headlines_mocked():
+    from src.data.pipeline import MarketDataPipeline
+    from unittest.mock import patch, MagicMock
+    
+    pipeline = MarketDataPipeline()
+    with patch("src.data.pipeline.yf.Ticker") as mock_ticker:
+        mock_instance = MagicMock()
+        mock_instance.news = [{"title": "Apple is doing well", "link": "http", "providerPublishTime": 12345}]
+        mock_ticker.return_value = mock_instance
+        
+        res = pipeline.fetch_news_headlines("AAPL", days=10)
+        assert len(res) == 1
+        assert res[0]["title"] == "Apple is doing well"

@@ -188,38 +188,18 @@ def test_tier2_overnight_gap_stop(backtest_db):
     broker.price_feed["GAPPER"] = entry_price
 
     # ------------------------------------------------------------------
-    # Run the gap-stop detection block (same logic as tier2_replay.py:156-223)
-    # on bar[1] (the gap bar)
     # ------------------------------------------------------------------
-    enriched = {"GAPPER": MarketDataPipeline.compute_indicators(gapper_df)}
-    trade_records = []
-    equity_start  = broker.get_account_balance().equity
-
-    gap_date = dates[1]
-    bar = enriched["GAPPER"].loc[gap_date]
-
-    open_pos = broker.get_positions()
-    for pos in open_pos:
-        if bar["open"] <= pos.stop_loss:
-            gap_exit_price = bar["open"] * (1.0 - half_spread)
-            broker.set_price(pos.ticker, gap_exit_price)
-            broker.close_position(pos.position_id)
-            pnl = round((gap_exit_price - pos.entry_price) * pos.qty, 2)
-            trade_records.append(
-                ReplayTradeRecord(
-                    ticker=pos.ticker,
-                    entry_date=pos.opened_at.strftime("%Y-%m-%d"),
-                    exit_date=gap_date.strftime("%Y-%m-%d"),
-                    entry_price=pos.entry_price,
-                    exit_price=gap_exit_price,
-                    qty=pos.qty,
-                    pnl=pnl,
-                    exit_reason="GAP_STOP",
-                    holding_days=1,
-                )
-            )
-
+    # Run the replay engine so it hits the code in tier2_replay.py
+    # ------------------------------------------------------------------
+    engine = Tier2HistoricalReplayEngine(db=backtest_db, initial_capital=100.0)
+    
+    import unittest.mock
+    with unittest.mock.patch("src.backtest.tier2_replay.SimulatedPaperBroker", return_value=broker):
+        report = engine.run_replay({"GAPPER": gapper_df})
+        
+    trade_records = report.trades
     equity_end = broker.get_account_balance().equity
+    equity_start = 100.0
 
     # ------------------------------------------------------------------
     # Assertions

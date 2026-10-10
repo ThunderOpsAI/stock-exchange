@@ -74,3 +74,64 @@ def test_failed_cycle_releases_lease_and_records_failure(db, monkeypatch):
     last = db.get_last_trading_run()
     assert last["status"] == "FAILED" and "boom" in last["error_message"]
     assert db.get_active_trading_run() is None
+
+def test_main_cli(monkeypatch):
+    import sys
+    from src.main import main
+    from unittest.mock import patch, MagicMock
+    
+    with patch("src.main.TradingDeskOrchestrator") as mock_orch, \
+         patch("src.main.subprocess.run") as mock_sub, \
+         patch("src.main.Tier1VectorizedBacktester") as mock_t1, \
+         patch("src.main.Tier2HistoricalReplayEngine") as mock_t2, \
+         patch("src.main.MarketDataPipeline") as mock_mdp:
+         
+        mock_instance = MagicMock()
+        mock_instance.run_daily_cycle.return_value = {"status": "SUCCESS"}
+        mock_orch.return_value = mock_instance
+        
+        mock_res1 = MagicMock()
+        mock_res1.total_trades = 10
+        mock_res1.win_rate = 0.6
+        mock_res1.profit_factor = 1.5
+        mock_res1.expectancy_r = 0.5
+        mock_res1.sharpe_ratio = 1.2
+        mock_res1.sortino_ratio = 1.5
+        mock_res1.max_drawdown_pct = 10.0
+        mock_res1.final_equity = 110.0
+        mock_res1.circuit_breaker_breaches = 0
+        mock_t1.return_value.run.return_value = mock_res1
+        
+        mock_res2 = MagicMock()
+        mock_res2.regime_name = "BULL"
+        mock_res2.start_date = "2020"
+        mock_res2.end_date = "2021"
+        mock_res2.total_trades = 10
+        mock_res2.win_rate = 0.6
+        mock_res2.profit_factor = 1.5
+        mock_res2.max_drawdown_pct = 10.0
+        mock_res2.final_equity = 110.0
+        mock_t2.return_value.run_replay.return_value = mock_res2
+        
+        # mock sleep
+        with patch("src.main.time.sleep", side_effect=KeyboardInterrupt):
+            monkeypatch.setattr(sys, "argv", ["main.py", "--loop"])
+            try:
+                main()
+            except KeyboardInterrupt:
+                pass
+            
+            monkeypatch.setattr(sys, "argv", ["main.py", "--run-once"])
+            main()
+            
+            monkeypatch.setattr(sys, "argv", ["main.py", "--dashboard"])
+            main()
+            mock_sub.assert_called_once()
+            
+            monkeypatch.setattr(sys, "argv", ["main.py", "--backtest-tier1"])
+            main()
+            mock_t1.assert_called_once()
+            
+            monkeypatch.setattr(sys, "argv", ["main.py", "--backtest-tier2"])
+            main()
+            mock_t2.assert_called_once()

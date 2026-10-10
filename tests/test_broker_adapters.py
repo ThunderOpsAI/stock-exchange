@@ -205,3 +205,102 @@ def test_broker_factory():
 
     with pytest.raises(ValueError):
         get_broker_adapter("unknown_broker")
+
+def test_etoro_connect_health_check_get_positions_close_modify():
+    from unittest.mock import patch, MagicMock
+    from src.broker.etoro import EtoroBrokerAdapter
+    from src.domain.models import Position, PositionStatus, OrderSide
+
+    adapter = EtoroBrokerAdapter(
+        api_key="mock",
+        user_key="mock",
+        base_url="https://mock-etoro.com",
+    )
+
+    with patch.object(adapter.session, "request") as mock_req:
+        # 1. connect() and health_check()
+        health_resp = MagicMock()
+        health_resp.status_code = 200
+        health_resp.json.return_value = {"status": "ok"}
+        
+        mock_req.side_effect = [health_resp, health_resp]
+        
+        adapter.connect()
+        assert adapter.health_check() is True
+
+        # 2. get_positions()
+        pos_resp = MagicMock()
+        pos_resp.status_code = 200
+        pos_resp.json.return_value = {
+            "positions": [
+                {
+                    "positionId": "123",
+                    "symbol": "AAPL",
+                    "amount": 1500.0,
+                    "netProfit": 50.0,
+                    "isBuy": True,
+                    "units": 10,
+                    "openRate": 150.0,
+                    "currentRate": 155.0,
+                    "stopLossRate": 140.0,
+                    "takeProfitRate": 160.0
+                }
+            ]
+        }
+        mock_req.side_effect = [pos_resp]
+        positions = adapter.get_positions()
+        assert len(positions) == 1
+        assert positions[0].ticker == "AAPL"
+        assert positions[0].broker_position_id == "123"
+
+        # 3. close_position()
+        close_resp = MagicMock()
+        close_resp.status_code = 200
+        close_resp.text = "{}"
+        close_resp.json.return_value = {}
+        mock_req.side_effect = [close_resp]
+        adapter.close_position("123")
+        assert mock_req.call_count == 4
+
+        # 4. modify_position()
+        mod_resp = MagicMock()
+        mod_resp.status_code = 200
+        mod_resp.text = "{}"
+        mod_resp.json.return_value = {}
+        mock_req.side_effect = [mod_resp]
+        adapter.modify_position("123", stop_loss=145.0)
+        assert mock_req.call_count == 5
+
+def test_alpaca_ws_and_polling():
+    from unittest.mock import patch, MagicMock
+    from src.broker.alpaca import AlpacaPaperBroker
+
+    adapter = AlpacaPaperBroker(
+        api_key="mock",
+        secret_key="mock",
+        base_url="https://mock",
+    )
+
+    with patch.object(adapter.session, "request") as mock_req:
+        # Mock get_positions
+        pos_resp = MagicMock()
+        pos_resp.status_code = 200
+        pos_resp.json.return_value = [{"symbol": "AAPL", "qty": "10", "side": "long", "avg_entry_price": "150.0", "current_price": "155.0", "unrealized_pl": "50.0", "id": "pos_1"}]
+        mock_req.side_effect = [pos_resp]
+        
+        positions = adapter.get_positions()
+        assert len(positions) == 1
+        assert positions[0].ticker == "AAPL"
+
+        # Mock order status polling
+        poll_resp = MagicMock()
+        poll_resp.status_code = 200
+        poll_resp.json.return_value = [{"id": "ord_1", "status": "filled"}]
+        mock_req.side_effect = [poll_resp]
+        
+        from src.domain.models import OrderState
+        state = adapter.get_open_orders()
+        assert len(state) == 1
+        
+
+
