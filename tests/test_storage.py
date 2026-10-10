@@ -54,8 +54,11 @@ def temp_db():
         os.remove(shm_file)
 
 
-def test_wal_mode_and_foreign_keys(temp_db):
-    with temp_db.session() as conn:
+def test_wal_mode_and_foreign_keys(monkeypatch, tmp_path):
+    monkeypatch.setenv("SQLITE_JOURNAL_MODE", "WAL")
+    db_path = str(tmp_path / "test_wal.db")
+    db = Database(db_path=db_path)
+    with db.session() as conn:
         journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
         assert journal_mode.lower() == "wal"
         foreign_keys = conn.execute("PRAGMA foreign_keys;").fetchone()[0]

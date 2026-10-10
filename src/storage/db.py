@@ -54,7 +54,12 @@ class Database:
     def get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
+        journal_mode = os.environ.get("SQLITE_JOURNAL_MODE", "WAL")
+        if journal_mode:
+            try:
+                conn.execute(f"PRAGMA journal_mode = {journal_mode};")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn

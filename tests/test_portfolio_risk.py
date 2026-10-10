@@ -197,7 +197,8 @@ def test_portfolio_stop_risk_cap_boundaries(portfolio_risk_env):
 
 def test_strictest_limit_wins_priority(portfolio_risk_env):
     evaluator, _, broker, db = portfolio_risk_env
-    now = datetime.now(timezone.utc)
+    # Anchor to 12:00 UTC today so that (now - 3h) remains within today's UTC calendar day
+    now = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
 
     # Trigger both consecutive losses (3) and daily loss ($3.20)
     _save_closed_trade(db, "A", -1.00, now - timedelta(hours=3))

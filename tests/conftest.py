@@ -5,9 +5,23 @@ Provides deterministic database isolation, lockfile isolation, and environment s
 
 import os
 from pathlib import Path
+import resource
 import pytest
 
 from src.storage.db import Database
+
+
+def pytest_sessionstart(session):
+    """Raise open file descriptor limit on macOS to prevent SQLite disk I/O errors during large test runs."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(4096, hard) if hard != resource.RLIM_INFINITY else 4096
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        pass
+    os.environ.setdefault("SQLITE_JOURNAL_MODE", "DELETE")
+    os.environ.setdefault("TRADING_MODE", "paper")
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +31,8 @@ def guard_root_lock(tmp_path, monkeypatch):
     and ensure paper trading environment flags are enforced.
     """
     monkeypatch.setenv("TRADING_MODE", "paper")
+    if "SQLITE_JOURNAL_MODE" not in os.environ:
+        monkeypatch.setenv("SQLITE_JOURNAL_MODE", "DELETE")
     root_lock = Path("HALTED.lock")
     had_root_lock = root_lock.exists()
 
