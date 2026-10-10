@@ -19,3 +19,12 @@ htmlcov/
 *.db-shm
 HALTED.lock
 .env
+# Added by git setup script
+node_modules/
+.DS_Store
+.env.local
+.env.*.local
+*.log
+dist/
+build/
+.next/
