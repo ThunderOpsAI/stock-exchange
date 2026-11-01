@@ -35,6 +35,7 @@ class QuantitativeScreener:
         require_quote: bool = False,
         max_quote_age_seconds: float = 60.0,
         calendar_gate: Optional[Any] = None,
+        aggressive_mode: bool = False,
     ):
         self.min_addv = min_addv
         self.max_spread_rel = max_spread_rel
@@ -44,6 +45,7 @@ class QuantitativeScreener:
         self.require_quote = require_quote
         self.max_quote_age_seconds = max_quote_age_seconds
         self.calendar_gate = calendar_gate
+        self.aggressive_mode = aggressive_mode
 
     def check_macro_regime(self, spy_df: Optional[pd.DataFrame]) -> Tuple[bool, str]:
         """
@@ -82,6 +84,11 @@ class QuantitativeScreener:
         sma_200_val = float(sma_200)
         sma_50_val = float(sma_50)
         sma_50_prev_val = float(sma_50_prev)
+
+        if self.aggressive_mode:
+            if close_val < sma_200_val * 0.98:
+                return False, f"SPY close (${close_val:.2f}) < 98% SMA 200 (${sma_200_val * 0.98:.2f})"
+            return True, "SPY macro regime meets Aggressive Desk criteria (Close >= 0.98 * SMA 200)"
 
         if close_val <= sma_200_val:
             return False, f"SPY close (${close_val:.2f}) <= SMA 200 (${sma_200_val:.2f})"
@@ -328,6 +335,90 @@ class QuantitativeScreener:
             status=CandidateStatus.PENDING_DELIBERATION,
         )
 
+    def evaluate_momentum_breakout(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        quote: Optional[ExecutionQuote] = None,
+        require_quote: Optional[bool] = None,
+    ) -> Optional[ScreenedCandidate]:
+        """
+        Strategy Gamma: High-Beta Momentum Breakout & Volume Surge (Aggressive Desk).
+        - Breakout: Close within 1.5% of or breaking 10-day high
+        - Momentum: Close > EMA20, RSI14 >= 50
+        - Volume expansion: RVOL20 >= 1.30
+        - Bullish expansion candle: Close > Open
+        - Sizing: $3.00 max risk, targeting aggressive 3:1 R:R (+15% to +35% upside)
+        """
+        should_require_quote = self.require_quote if require_quote is None else require_quote
+        if should_require_quote and (quote is None or not quote.is_valid):
+            return None
+
+        if quote is not None and not quote.is_valid:
+            return None
+
+        if len(df) < 20:
+            return None
+
+        curr = df.iloc[-1]
+        close = curr["close"]
+        open_p = curr["open"]
+        ema_20 = curr.get("ema_20")
+        rsi_14 = curr.get("rsi_14", 50.0)
+        atr_14 = curr.get("atr_14", close * 0.03)
+        rs_spy = curr.get("rs_spy_63d", 1.0)
+        rvol = curr.get("rvol_20", 1.0)
+
+        if pd.isna(close) or pd.isna(ema_20):
+            return None
+
+        # 1. Base trend & momentum alignment
+        if close < ema_20 or rsi_14 < 50.0:
+            return None
+
+        # 2. 10-day breakout check
+        prior_10_high = df["high"].iloc[-11:-1].max() if len(df) >= 11 else df["high"].iloc[:-1].max()
+        if pd.isna(prior_10_high) or prior_10_high <= 0:
+            return None
+
+        if close < prior_10_high * 0.985:
+            return None
+
+        # 3. Volume and candle confirmation
+        if not (close > open_p and rvol >= 1.30):
+            return None
+
+        entry_price = quote.ask if (quote is not None and quote.is_valid) else close
+
+        recent_low = float(df["low"].iloc[-3:].min())
+        stop_loss = round(max(recent_low - (0.5 * atr_14), entry_price - (1.75 * atr_14)), 2)
+        if stop_loss >= entry_price:
+            stop_loss = round(entry_price * 0.94, 2)
+
+        risk_r = round(entry_price - stop_loss, 2)
+        if risk_r <= 0.05:
+            return None
+
+        take_profit = round(entry_price + (3.0 * risk_r), 2)
+        max_capital_by_risk = (self.max_risk_cap_usd * entry_price) / risk_r
+        allocated_usd = round(min(self.slot_target_usd, max_capital_by_risk), 2)
+
+        raw_score = (rs_spy * 0.4) + (rvol * 0.4) + ((close / ema_20 - 1.0) * 10.0)
+
+        return ScreenedCandidate(
+            candidate_id=f"cand_{ticker.lower()}_{uuid.uuid4().hex[:6]}",
+            timestamp=datetime.now(timezone.utc),
+            ticker=ticker.upper(),
+            strategy=StrategyType.MOMENTUM_BREAKOUT,
+            entry_est=round(entry_price, 2),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            risk_r=risk_r,
+            allocated_usd=allocated_usd,
+            rank_score=round(raw_score, 4),
+            status=CandidateStatus.PENDING_DELIBERATION,
+        )
+
     def rank_candidates(
         self,
         candidates: List[ScreenedCandidate],
@@ -384,9 +475,11 @@ class QuantitativeScreener:
         ranked_list = []
         for i, m in enumerate(metrics):
             composite = 0.40 * z_rs[i] + 0.30 * z_rvol[i] + 0.15 * z_atr[i] - 0.15 * z_spr[i]
-            # Strategy alpha bias (60% vs 40%)
+            # Strategy bias
             if m["cand"].strategy == StrategyType.TREND_PULLBACK:
                 composite += 0.20
+            elif m["cand"].strategy == StrategyType.MOMENTUM_BREAKOUT:
+                composite += 0.25
 
             cand = m["cand"]
             cand.rank_score = round(float(composite), 4)
@@ -434,6 +527,15 @@ class QuantitativeScreener:
             )
             if not passed_liq:
                 continue
+
+            # In aggressive mode, check Momentum Breakout first!
+            if self.aggressive_mode:
+                c_mom = self.evaluate_momentum_breakout(
+                    ticker, df, quote=quote, require_quote=require_quote
+                )
+                if c_mom:
+                    candidates.append(c_mom)
+                    continue
 
             # Check Trend Pullback
             c_trend = self.evaluate_trend_pullback(

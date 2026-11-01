@@ -26,16 +26,17 @@ def test_fresh_db_migrations(clean_db_path):
     engine = MigrationEngine(db_path=clean_db_path)
     applied = engine.run_migrations()
 
-    assert applied == [1, 2]
+    assert applied == [1, 2, 3]
 
     # Verify schema_migrations table
     conn = sqlite3.connect(clean_db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT version, name FROM schema_migrations ORDER BY version ASC")
     rows = cursor.fetchall()
-    assert len(rows) == 2
+    assert len(rows) == 3
     assert rows[0][0] == 1
     assert rows[1][0] == 2
+    assert rows[2][0] == 3
 
     # Verify newly added Phase 2 tables exist
     cursor.execute(
@@ -63,7 +64,7 @@ def test_migration_idempotency(clean_db_path):
     """Verifies that running migrations multiple times is completely idempotent."""
     engine = MigrationEngine(db_path=clean_db_path)
     first_run = engine.run_migrations()
-    assert first_run == [1, 2]
+    assert first_run == [1, 2, 3]
 
     second_run = engine.run_migrations()
     assert second_run == []  # No new migrations applied
@@ -88,14 +89,14 @@ def test_legacy_db_bootstrap_and_migration(clean_db_path):
     engine = MigrationEngine(db_path=clean_db_path)
     applied = engine.run_migrations()
 
-    # Should only apply migration 2
-    assert applied == [2]
+    # Should apply migrations 2 and 3
+    assert applied == [2, 3]
 
     conn = sqlite3.connect(clean_db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT version FROM schema_migrations ORDER BY version ASC")
     versions = [r[0] for r in cursor.fetchall()]
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
     conn.close()
 
 

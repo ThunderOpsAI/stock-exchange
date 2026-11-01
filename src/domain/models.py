@@ -37,6 +37,7 @@ class OrderState(str, Enum):
 class StrategyType(str, Enum):
     TREND_PULLBACK = "TREND_PULLBACK"
     MEAN_REVERSION = "MEAN_REVERSION"
+    MOMENTUM_BREAKOUT = "MOMENTUM_BREAKOUT"
 
 
 class CandidateStatus(str, Enum):

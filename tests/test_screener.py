@@ -529,3 +529,61 @@ def test_scan_universe_filters_wide_spread_with_execution_quotes():
     assert len(candidates_ok) == 1
     assert candidates_ok[0].ticker == "NVDA"
     assert candidates_ok[0].entry_est == pytest.approx(100.02, abs=0.01)
+
+
+def test_evaluate_momentum_breakout_strategy_gamma():
+    """Verify Strategy Gamma (Momentum Breakout) detects high-beta breakouts."""
+    screener = QuantitativeScreener(aggressive_mode=True, min_addv=5_000_000.0, min_price=5.0)
+
+    df = generate_synthetic_bars(100, base_price=20.0, trend_slope=0.15, volume_base=500_000.0)
+    df = MarketDataPipeline.compute_indicators(df)
+
+    # Set up breakout: price closes above prior 10-day high with high RVOL and RSI > 50
+    prior_10_high = df["high"].iloc[-11:-1].max()
+    df.iloc[-1, df.columns.get_loc("close")] = prior_10_high * 1.03
+    df.iloc[-1, df.columns.get_loc("open")] = prior_10_high * 0.99
+    df.iloc[-1, df.columns.get_loc("high")] = prior_10_high * 1.04
+    df.iloc[-1, df.columns.get_loc("low")] = prior_10_high * 0.98
+    df.iloc[-1, df.columns.get_loc("rvol_20")] = 1.85
+    df.iloc[-1, df.columns.get_loc("rsi_14")] = 62.0
+    df.iloc[-1, df.columns.get_loc("ema_20")] = prior_10_high * 0.95
+
+    cand = screener.evaluate_momentum_breakout("ASTS", df)
+    assert cand is not None
+    assert cand.ticker == "ASTS"
+    assert cand.strategy == StrategyType.MOMENTUM_BREAKOUT
+    assert cand.take_profit > cand.entry_est
+    assert cand.stop_loss < cand.entry_est
+    assert cand.risk_r > 0.05
+    assert cand.allocated_usd <= 30.0
+
+
+def test_aggressive_mode_scan_universe():
+    """Verify aggressive screener mode scans for momentum breakouts and applies relaxed filters."""
+    screener = QuantitativeScreener(
+        aggressive_mode=True,
+        min_addv=5_000_000.0,
+        min_price=5.0,
+        max_spread_rel=0.0025,
+    )
+
+    df_spy = generate_synthetic_bars(220, base_price=500.0, trend_slope=0.2)
+    df_spy = MarketDataPipeline.compute_indicators(df_spy)
+
+    df_asts = generate_synthetic_bars(100, base_price=25.0, trend_slope=0.2, volume_base=400_000.0)
+    df_asts = MarketDataPipeline.compute_indicators(df_asts)
+    prior_10_high = df_asts["high"].iloc[-11:-1].max()
+    df_asts.iloc[-1, df_asts.columns.get_loc("close")] = prior_10_high * 1.02
+    df_asts.iloc[-1, df_asts.columns.get_loc("open")] = prior_10_high * 0.99
+    df_asts.iloc[-1, df_asts.columns.get_loc("high")] = prior_10_high * 1.03
+    df_asts.iloc[-1, df_asts.columns.get_loc("low")] = prior_10_high * 0.98
+    df_asts.iloc[-1, df_asts.columns.get_loc("rvol_20")] = 2.1
+    df_asts.iloc[-1, df_asts.columns.get_loc("rsi_14")] = 65.0
+    df_asts.iloc[-1, df_asts.columns.get_loc("ema_20")] = prior_10_high * 0.94
+
+    universe = {"SPY": df_spy, "ASTS": df_asts}
+    candidates = screener.scan_universe(universe, spy_df=df_spy)
+    assert len(candidates) >= 1
+    assert candidates[0].ticker == "ASTS"
+    assert candidates[0].strategy == StrategyType.MOMENTUM_BREAKOUT
+

@@ -506,7 +506,7 @@ def test_fetch_daily_bars_mocked():
         mock_instance.history.return_value = df
         mock_ticker.return_value = mock_instance
         
-        res = pipeline.fetch_daily_bars("AAPL", days=10)
+        res = pipeline.fetch_daily_bars("AAPL", days=10, use_cache=False)
         assert res is not None
         assert "open" in res.columns
         assert res.iloc[0]["open"] == 100.0

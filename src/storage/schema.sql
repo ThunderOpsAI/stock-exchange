@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS screened_candidates (
     candidate_id TEXT PRIMARY KEY,
     timestamp TIMESTAMP NOT NULL,
     ticker TEXT NOT NULL,
-    strategy TEXT NOT NULL CHECK(strategy IN ('TREND_PULLBACK', 'MEAN_REVERSION')),
+    strategy TEXT NOT NULL CHECK(strategy IN ('TREND_PULLBACK', 'MEAN_REVERSION', 'MOMENTUM_BREAKOUT')),
     entry_est REAL NOT NULL,
     stop_loss REAL NOT NULL,
     take_profit REAL NOT NULL,

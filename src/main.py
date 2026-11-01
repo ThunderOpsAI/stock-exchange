@@ -36,6 +36,7 @@ from src.broker.base import AbstractBrokerAdapter
 from src.broker.factory import get_broker_adapter
 from src.broker.reconciliation import ReconciliationService
 from src.data.pipeline import MarketDataPipeline
+from src.data.universe import get_universe
 from src.domain.models import (
     AuditSeverity,
     CandidateStatus,
@@ -57,19 +58,36 @@ DEFAULT_UNIVERSE = [
 class TradingDeskOrchestrator:
     def __init__(
         self,
-        db_path: str = DEFAULT_DB_PATH,
+        db_path: Optional[str] = None,
         broker_type: str = "simulated",
         cache_mode: CacheMode = CacheMode.RECORD_ON_MISS,
         universe: Optional[List[str]] = None,
+        profile: str = "core",
     ):
+        self.profile = profile.lower()
+        if db_path is None:
+            db_path = "data/trading_aggressive.db" if self.profile == "aggressive" else DEFAULT_DB_PATH
+
         self.db = Database(db_path=db_path)
         self.broker_type = broker_type
         self.broker = get_broker_adapter(broker_type)
         self.risk_engine = RiskEngine(db=self.db, broker=self.broker)
-        self.screener = QuantitativeScreener()
+
+        if self.profile == "aggressive":
+            self.screener = QuantitativeScreener(
+                min_addv=5_000_000.0,
+                max_spread_rel=0.0025,
+                min_price=5.0,
+                aggressive_mode=True,
+            )
+            default_univ = get_universe("aggressive")
+        else:
+            self.screener = QuantitativeScreener()
+            default_univ = get_universe("core")
+
         self.committee = TriadLLMCommittee(db=self.db, cache_mode=cache_mode)
         self.pipeline = MarketDataPipeline()
-        self.universe = universe or DEFAULT_UNIVERSE
+        self.universe = universe or default_univ
 
     def run_daily_cycle(self) -> Dict[str, Any]:
         """Run one cycle under a singleton lease with startup reconciliation (fail closed)."""
@@ -124,7 +142,7 @@ class TradingDeskOrchestrator:
         8. Bracket watchdog & portfolio snapshot
         """
         cycle_start = datetime.now(timezone.utc)
-        print(f"\n[{cycle_start.isoformat()}] --- STARTING TRADING DESK CYCLE ---")
+        print(f"\n[{cycle_start.isoformat()}] --- STARTING {self.profile.upper()} TRADING DESK CYCLE ---")
 
         # 1. Lock check
         if self.risk_engine.is_hard_locked():
@@ -139,11 +157,16 @@ class TradingDeskOrchestrator:
 
         # 2. Ingest Data
         print(f"📥 Ingesting market data for universe ({len(self.universe)} tickers)...")
-        universe_dfs = {}
-        for ticker in self.universe:
-            df = self.pipeline.fetch_daily_bars(ticker, days=365)
-            if not df.empty:
-                universe_dfs[ticker] = df
+        tickers_to_fetch = list(self.universe)
+        if "SPY" not in tickers_to_fetch:
+            tickers_to_fetch.append("SPY")
+
+        batch_results = self.pipeline.batch_fetch_daily_bars(tickers_to_fetch, days=365)
+        universe_dfs = {
+            sym: res.df
+            for sym, res in batch_results.items()
+            if res.df is not None and not res.df.empty
+        }
 
         spy_df = universe_dfs.get("SPY")
         if spy_df is None or spy_df.empty:
@@ -239,7 +262,9 @@ def main():
     parser.add_argument("--dashboard", action="store_true", help="Launch Streamlit Dashboard")
     parser.add_argument("--bot", action="store_true", help="Launch Telegram Bot Daemon")
     parser.add_argument("--broker", type=str, default="simulated", choices=["simulated", "alpaca", "etoro"], help="Broker adapter")
-    parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help="SQLite DB path")
+    parser.add_argument("--db", type=str, default=None, help="SQLite DB path (defaults to profile-specific DB)")
+    parser.add_argument("--profile", type=str, default="core", choices=["core", "aggressive"], help="Trading desk profile: 'core' (conservative swing) or 'aggressive' (weekly momentum breakout)")
+    parser.add_argument("--universe", type=str, default=None, choices=["core", "startups", "large_cap", "aggressive", "all"], help="Universe preset selector")
 
     args = parser.parse_args()
 
@@ -269,7 +294,7 @@ def main():
 
     if args.backtest_tier2:
         print("📊 Running Tier 2 Event-Driven Historical Replay...")
-        db = Database(db_path=args.db)
+        db = Database(db_path=args.db or DEFAULT_DB_PATH)
         engine = Tier2HistoricalReplayEngine(db=db)
         pipeline = MarketDataPipeline()
         universe_dfs = {}
@@ -286,7 +311,13 @@ def main():
         return
 
     # Normal trading orchestrator
-    desk = TradingDeskOrchestrator(db_path=args.db, broker_type=args.broker)
+    selected_universe = get_universe(args.universe) if args.universe else None
+    desk = TradingDeskOrchestrator(
+        db_path=args.db,
+        broker_type=args.broker,
+        universe=selected_universe,
+        profile=args.profile,
+    )
 
     if args.run_once:
         desk.run_daily_cycle()

@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -337,6 +338,47 @@ class MarketDataPipeline:
             f"(classification={result.error_classification}, status={result.status.value})"
         )
         return pd.DataFrame()
+
+    def batch_fetch_daily_bars(
+        self,
+        tickers: List[str],
+        max_workers: int = 8,
+        use_cache: bool = True,
+        days: int = 365,
+    ) -> Dict[str, MarketDataResult]:
+        """
+        Fetches daily bars for multiple tickers concurrently while maintaining
+        strict fail-closed verification, provenance tracking, and disk caching.
+        """
+        results: Dict[str, MarketDataResult] = {}
+        if not tickers:
+            return results
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ticker = {
+                executor.submit(
+                    self.fetch_daily_bars_result,
+                    ticker,
+                    days=days,
+                    use_cache=use_cache,
+                ): ticker
+                for ticker in tickers
+            }
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    res = future.result()
+                    results[ticker.upper()] = res
+                except Exception as exc:
+                    results[ticker.upper()] = self._build_failure_result(
+                        ticker=ticker,
+                        status=MarketDataHealth.ERROR,
+                        freshness=DataFreshness.ERROR,
+                        classification=self._classify_exception(exc),
+                        reason=f"Concurrent fetch failed: {exc}",
+                        source="pipeline_batch",
+                    )
+        return results
 
     def inject_quote(self, quote: ExecutionQuote) -> None:
         """Injects a typed execution quote for testing or simulated environments."""
